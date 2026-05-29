@@ -1,4 +1,15 @@
+# Secrets — never commit
+.api_key
+client_secret.json
+
+# Compiled binaries
 navi
 test_window
 trigger_navi
+test_hotkey_carbon
+test_text
+
+# Tool caches / scratch
+.memsearch/
+prompt.txt
 .DS_Store

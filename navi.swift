@@ -1,5 +1,20 @@
 import Cocoa
 import QuartzCore
+import Carbon
+
+// MARK: - App State
+private enum NaviState {
+    case wandering
+    case listening
+    case thinking
+    case speaking
+}
+
+private enum InputMode {
+    case gemini   // Cmd+Shift+Space — ask Navi (Gemini)
+    case mini     // Cmd+Shift+M     — ask the Mac mini (remote shell over Tailscale)
+}
+
 
 private func degrees(_ value: CGFloat) -> CGFloat {
     value * .pi / 180
@@ -101,6 +116,21 @@ private enum WingTag: Int, CaseIterable {
     }
 }
 
+final class InputWindow: NSWindow {
+    override var canBecomeKey: Bool {
+        return true
+    }
+    override var canBecomeMain: Bool {
+        return true
+    }
+}
+
+final class NonVibrantTextField: NSTextField {
+    override var allowsVibrancy: Bool {
+        return false
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let fairySize: CGFloat = 130
     private let edgeInset: CGFloat = 48
@@ -114,18 +144,105 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var bodyView: NSImageView!
     private var wingLayers: [WingTag: CALayer] = [:]
     private var sparkleViews: [NSView] = []
-    private var isAnimating = false
+    
+    // Custom transparent field editor to avoid grey bounding box
+    private var customFieldEditor: NSTextView?
+    
+    // Carbon HotKey refs
+    private var hotKeyRef: EventHotKeyRef?      // Cmd+Shift+Space (Gemini)
+    private var hotKeyRef2: EventHotKeyRef?     // Cmd+Shift+M (Mac mini)
+    private var eventHandlerRef: EventHandlerRef?
+    
+    // Static reference for the Carbon C-callback
+    static weak var shared: AppDelegate?
+    
+    private var currentState: NaviState = .wandering
+    private var inputWindow: NSWindow?
+    private var inputField: NSTextField?
+    private var outputWindow: NSWindow?
+    private var outputField: NSTextField?
+    private var typewriterTimer: Timer?
+    
+    // Sounds
+    private var inSound: NSSound?
+    private var outSound: NSSound?
+    private var heySound: NSSound?   // "Hey! Listen!" — plays when remote jobs finish
+
+    // Gemini AI Service
+    private let geminiService = GeminiService()
+
+    // Remote (Mac mini) terminal monitor
+    private let remoteMonitor = RemoteMonitor()
+    private var remoteShells = 0
+    private var remoteBusy = 0
+    private var remoteReachable = false
+    private var ambientBusy = false   // currently showing the calm "remote is working" glow
+    private var inputMode: InputMode = .gemini
+
+    // Per-terminal diffing for attention events
+    private var prevTerminals: [String: String] = [:]
+    private var hadFirstPoll = false
+    private var attentionTimer: Timer?   // non-nil while a fast-flap attention burst is active
+
+    // System-pressure adaptivity
+    private let systemLoad = SystemLoad()
+    private var loadTimer: Timer?
+    private var calmMode = false        // machine is busy -> hover in place, stop flying
+    private var displayAsleep = false   // display off / screen locked -> fully idle
 
     private var fairyCenter: CGPoint {
         CGPoint(x: fairySize / 2, y: fairySize / 2)
     }
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        let visibleFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
-        let startFrame = centeredFrame(in: visibleFrame)
+    // MARK: - Fairy positioning (window-local coordinates)
 
+    /// Size of the full-screen overlay's content area.
+    private var contentSize: CGSize {
+        window.contentView?.bounds.size ?? .zero
+    }
+
+    /// Window-local origin that centers the fairy.
+    private func centeredLocalOrigin() -> CGPoint {
+        let cs = contentSize
+        return CGPoint(x: (cs.width - fairySize) / 2, y: (cs.height - fairySize) / 2)
+    }
+
+    /// Convert a window-local origin to a screen point (for the input/output popovers).
+    private func screenOrigin(forLocal local: CGPoint) -> CGPoint {
+        CGPoint(x: window.frame.minX + local.x, y: window.frame.minY + local.y)
+    }
+
+    /// The fairy's current frame in screen coordinates.
+    private func fairyScreenFrame() -> NSRect {
+        NSRect(origin: screenOrigin(forLocal: fairyView.frame.origin),
+               size: CGSize(width: fairySize, height: fairySize))
+    }
+
+    /// Animate the fairy to a window-local origin by moving the view (not the window).
+    private func moveFairy(toLocal origin: CGPoint,
+                           duration: TimeInterval,
+                           timing: CAMediaTimingFunctionName,
+                           completion: (() -> Void)? = nil) {
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = duration
+            context.timingFunction = CAMediaTimingFunction(name: timing)
+            self.fairyView.animator().setFrameOrigin(origin)
+        }, completionHandler: completion)
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        AppDelegate.shared = self
+        
+        loadSounds()
+        
+        let visibleFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
+
+        // One full-screen, transparent, click-through overlay. The fairy moves as a
+        // view *inside* this window (cheap GPU compositing) instead of the whole window
+        // being repositioned each leg (which goes through WindowServer and stutters
+        // under graphics load).
         window = NSWindow(
-            contentRect: startFrame,
+            contentRect: visibleFrame,
             styleMask: [.borderless],
             backing: .buffered,
             defer: false
@@ -137,11 +254,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.ignoresMouseEvents = true
         window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
 
-        let contentView = NSView(frame: NSRect(origin: .zero, size: startFrame.size))
+        let contentView = NSView(frame: NSRect(origin: .zero, size: visibleFrame.size))
         contentView.wantsLayer = true
         contentView.layer?.masksToBounds = false
 
-        fairyView = NSView(frame: contentView.bounds)
+        // Fairy starts centered, in window-local coordinates.
+        let startLocal = CGPoint(x: (visibleFrame.width - fairySize) / 2,
+                                 y: (visibleFrame.height - fairySize) / 2)
+        fairyView = NSView(frame: NSRect(origin: startLocal,
+                                         size: CGSize(width: fairySize, height: fairySize)))
         fairyView.wantsLayer = true
         fairyView.layer?.masksToBounds = false
         contentView.addSubview(fairyView)
@@ -149,28 +270,576 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         buildFairy()
 
         window.contentView = contentView
+        window.setFrame(visibleFrame, display: true)
         window.orderFrontRegardless()
 
         startAmbientAnimations()
+        updateSparkleVisibility(count: 2)
         startWandering()
 
-        DistributedNotificationCenter.default().addObserver(
-            forName: NSNotification.Name("NaviTaskComplete"),
-            object: nil,
-            queue: nil
-        ) { [weak self] _ in
-            self?.triggerExcitement()
+
+        setupGlobalHotkey()
+
+        // Begin reflecting the Mac mini's terminals over Tailscale.
+        remoteMonitor.onUpdate = { [weak self] status in
+            self?.handleRemoteStatus(status)
+        }
+        remoteMonitor.start()
+
+        startLoadMonitoring()
+    }
+
+    // MARK: - System-pressure adaptivity
+    //
+    // The fairy animates by physically moving its window, which leans on WindowServer.
+    // When the Mac is busy (or the screen is off) we stop flying and just hover in place
+    // so Navi never adds compositing pressure at the worst moment.
+
+    private func startLoadMonitoring() {
+        _ = systemLoad.cpuBusyFraction()   // prime the delta baseline
+        loadTimer = Timer.scheduledTimer(withTimeInterval: 4.0, repeats: true) { [weak self] _ in
+            self?.evaluateSystemPressure()
+        }
+
+        let ws = NSWorkspace.shared.notificationCenter
+        ws.addObserver(self, selector: #selector(displayDidSleep),
+                       name: NSWorkspace.screensDidSleepNotification, object: nil)
+        ws.addObserver(self, selector: #selector(displayDidWake),
+                       name: NSWorkspace.screensDidWakeNotification, object: nil)
+
+        // Screen lock/unlock isn't a screensaver-sleep event, so watch it separately.
+        let dnc = DistributedNotificationCenter.default()
+        dnc.addObserver(self, selector: #selector(displayDidSleep),
+                        name: NSNotification.Name("com.apple.screenIsLocked"), object: nil)
+        dnc.addObserver(self, selector: #selector(displayDidWake),
+                        name: NSNotification.Name("com.apple.screenIsUnlocked"), object: nil)
+    }
+
+    private func evaluateSystemPressure() {
+        let busy = systemLoad.cpuBusyFraction()
+        let perCore = systemLoad.loadPerCore()
+        // Hysteresis so we don't flip-flop around a single threshold.
+        let pressured = busy > 0.80 || perCore > 1.0
+        let relaxed   = busy < 0.60 && perCore < 0.7
+
+        if !calmMode && pressured {
+            calmMode = true                 // current wander leg finishes, then she hovers
+        } else if calmMode && relaxed {
+            calmMode = false
+            if currentState == .wandering && !displayAsleep {
+                startWandering()            // resume flying
+            }
         }
     }
 
-    private func centeredFrame(in visibleFrame: NSRect) -> NSRect {
-        NSRect(
-            x: visibleFrame.midX - (fairySize / 2),
-            y: visibleFrame.midY - (fairySize / 2),
-            width: fairySize,
-            height: fairySize
-        )
+    @objc private func displayDidSleep() {
+        displayAsleep = true
+        remoteMonitor.pause()               // stop SSH churn while nobody's watching
     }
+
+    @objc private func displayDidWake() {
+        displayAsleep = false
+        remoteMonitor.resume()
+        if currentState == .wandering && !calmMode {
+            startWandering()
+        }
+    }
+    
+    private func loadSounds() {
+        let naviDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".navi")
+        
+        let inURL = naviDir.appendingPathComponent("In.m4a")
+        if FileManager.default.fileExists(atPath: inURL.path) {
+            inSound = NSSound(contentsOf: inURL, byReference: true)
+        }
+        
+        let outURL = naviDir.appendingPathComponent("Out.m4a")
+        if FileManager.default.fileExists(atPath: outURL.path) {
+            outSound = NSSound(contentsOf: outURL, byReference: true)
+        }
+
+        let heyURL = naviDir.appendingPathComponent("Listen.m4a")
+        if FileManager.default.fileExists(atPath: heyURL.path) {
+            heySound = NSSound(contentsOf: heyURL, byReference: true)
+        }
+    }
+
+    // MARK: - Input & Hotkey Logic
+
+    private func setupGlobalHotkey() {
+        let opts = NSDictionary(object: kCFBooleanTrue, forKey: kAXTrustedCheckOptionPrompt.takeUnretainedValue() as NSString) as CFDictionary
+        let accessEnabled = AXIsProcessTrustedWithOptions(opts)
+        
+        if !accessEnabled {
+            print("WARNING: Accessibility access not granted. Global hotkey (Cmd+Shift+Space) will not work.")
+        } else {
+            print("Listening for Cmd+Shift+Space via Carbon...")
+        }
+        
+        // Command (cmdKey = 256), Shift (shiftKey = 512)
+        var hotKeyID = EventHotKeyID()
+        hotKeyID.signature = OSType(1337)
+        hotKeyID.id = UInt32(1)
+
+        // Key code for Space is 49.
+        var err = RegisterEventHotKey(UInt32(kVK_Space),
+                                      UInt32(cmdKey | shiftKey),
+                                      hotKeyID,
+                                      GetApplicationEventTarget(),
+                                      0,
+                                      &hotKeyRef)
+                                      
+        if err != noErr {
+            print("Error registering Carbon hot key: \(err)")
+        }
+
+        // Second hotkey: Cmd+Shift+M -> ask the Mac mini. Key code for 'M' is 46.
+        var hotKeyID2 = EventHotKeyID()
+        hotKeyID2.signature = OSType(1337)
+        hotKeyID2.id = UInt32(2)
+        err = RegisterEventHotKey(UInt32(kVK_ANSI_M),
+                                  UInt32(cmdKey | shiftKey),
+                                  hotKeyID2,
+                                  GetApplicationEventTarget(),
+                                  0,
+                                  &hotKeyRef2)
+        if err != noErr {
+            print("Error registering mini hot key: \(err)")
+        }
+
+        // Install event handler for the pressed hotkeys, dispatching on the hotkey id.
+        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        err = InstallEventHandler(GetApplicationEventTarget(),
+                                  { (nextHandler, theEvent, userData) -> OSStatus in
+                                      var firedID = EventHotKeyID()
+                                      GetEventParameter(theEvent,
+                                                        EventParamName(kEventParamDirectObject),
+                                                        EventParamType(typeEventHotKeyID),
+                                                        nil,
+                                                        MemoryLayout<EventHotKeyID>.size,
+                                                        nil,
+                                                        &firedID)
+                                      if firedID.id == 2 {
+                                          AppDelegate.shared?.toggleMiniState()
+                                      } else {
+                                          AppDelegate.shared?.toggleListeningState()
+                                      }
+                                      return noErr
+                                  },
+                                  1,
+                                  &eventType,
+                                  nil,
+                                  &eventHandlerRef)
+
+        if err != noErr {
+            print("Error installing event handler: \(err)")
+        }
+    }
+
+    private func toggleListeningState() {
+        if currentState == .listening {
+            cancelListening()
+        } else {
+            startListening(mode: .gemini)
+        }
+    }
+
+    private func toggleMiniState() {
+        if currentState == .listening {
+            cancelListening()
+        } else {
+            startListening(mode: .mini)
+        }
+    }
+
+    private func startListening(mode: InputMode) {
+        guard currentState == .wandering else { return }
+        inputMode = mode
+        currentState = .listening
+
+        // Drop any ambient "remote busy" styling so it doesn't fight the input glow.
+        ambientBusy = false
+
+        inSound?.play()
+        setFlapSpeed(excitedFlapSpeed) // Flap fast while traveling to center
+
+        // Stop wandering and glide to center.
+        moveFairy(toLocal: centeredLocalOrigin(), duration: 0.6, timing: .easeOut) {
+            self.setFlapSpeed(self.idleFlapSpeed) // Back to regular speed once there
+            self.showInputWindow(below: self.fairyScreenFrame())
+            self.glowView.layer?.shadowColor = NSColor.systemPurple.cgColor
+            self.glowView.layer?.shadowRadius = 20
+            self.glowView.layer?.shadowOpacity = 1.0
+        }
+    }
+
+    private func cancelListening() {
+        guard currentState == .listening else { return }
+        hideInputWindow()
+        outSound?.play()
+        
+        self.glowView.layer?.shadowOpacity = 0.0 // reset glow
+        setFlapSpeed(idleFlapSpeed)
+        
+        currentState = .wandering
+        startWandering()
+    }
+
+    private func showInputWindow(below fairyFrame: NSRect) {
+        if inputWindow == nil {
+            let width: CGFloat = 400
+            let height: CGFloat = 50
+            let inputFrame = NSRect(
+                x: fairyFrame.midX - (width / 2),
+                y: fairyFrame.minY - height - 20, // 20px below fairy
+                width: width,
+                height: height
+            )
+            
+            let win = InputWindow(
+                contentRect: inputFrame,
+                styleMask: [.borderless],
+                backing: .buffered,
+                defer: false
+            )
+            win.isOpaque = false
+            win.backgroundColor = .clear
+            win.level = .floating
+            win.hasShadow = true
+            win.delegate = self
+            
+            // Dark translucent background (no border)
+            let bgView = NSView(frame: NSRect(origin: .zero, size: inputFrame.size))
+            bgView.wantsLayer = true
+            bgView.layer?.backgroundColor = NSColor(calibratedWhite: 0.15, alpha: 0.85).cgColor
+            bgView.layer?.cornerRadius = 25
+            bgView.layer?.masksToBounds = true
+            
+            // Text Field
+            let tf = NonVibrantTextField(frame: NSRect(x: 20, y: 10, width: width - 40, height: 30))
+            tf.isBordered = false
+            tf.isBezeled = false
+            tf.drawsBackground = false
+            tf.backgroundColor = .clear
+            tf.focusRingType = .none
+            tf.font = NSFont.systemFont(ofSize: 18, weight: .regular)
+            tf.textColor = .white
+            tf.placeholderString = "Ask Navi..."
+            tf.delegate = self
+            
+            bgView.addSubview(tf)
+            win.contentView = bgView
+            
+            self.inputWindow = win
+            self.inputField = tf
+        } else {
+            let width: CGFloat = 400
+            let height: CGFloat = 50
+            let inputFrame = NSRect(
+                x: fairyFrame.midX - (width / 2),
+                y: fairyFrame.minY - height - 20,
+                width: width,
+                height: height
+            )
+            inputWindow?.setFrame(inputFrame, display: true)
+        }
+        
+        inputField?.placeholderString = (inputMode == .mini)
+            ? "Ask the mini…  (Enter = status)"
+            : "Ask Navi…"
+
+        NSApp.activate(ignoringOtherApps: true)
+        inputWindow?.makeKeyAndOrderFront(nil)
+        inputWindow?.makeFirstResponder(inputField)
+        
+        // Ensure navi is above the input
+        window.orderFrontRegardless()
+    }
+
+    private func hideInputWindow() {
+        inputWindow?.orderOut(nil)
+        inputField?.stringValue = ""
+    }
+
+    // MARK: - Agent Communication (Gemini API)
+
+    private func sendPromptToAgent(_ prompt: String) {
+        currentState = .thinking
+        hideInputWindow()
+        
+        // Fast flap to show thinking
+        setFlapSpeed(excitedFlapSpeed)
+        
+        // Check if API key is configured
+        if !geminiService.isAuthenticated {
+            print("No API key configured")
+            showResponse("Add your Gemini API key: echo 'KEY' > ~/.navi/.api_key")
+            return
+        }
+        
+        sendToGemini(prompt)
+    }
+    
+    private func sendToGemini(_ prompt: String) {
+        // Set a timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30.0) { [weak self] in
+            guard let self = self else { return }
+            if self.currentState == .thinking {
+                self.agentDidTimeout()
+            }
+        }
+        
+        geminiService.generateContent(prompt: prompt) { [weak self] result in
+            guard let self = self else { return }
+            guard self.currentState == .thinking else { return } // timed out already
+            
+            switch result {
+            case .success(let text):
+                self.triggerExcitement()
+                self.showResponse(text)
+            case .failure(let error):
+                print("Gemini error: \(error.localizedDescription)")
+                self.showResponse("Hmm... \(error.localizedDescription)")
+            }
+        }
+    }
+    
+    private func agentDidTimeout() {
+        print("Agent response timed out.")
+        outSound?.play()
+        currentState = .wandering
+        setFlapSpeed(idleFlapSpeed)
+        startWandering()
+    }
+
+    // MARK: - Remote (Mac mini) command + ambient status
+
+    /// Run whatever the user typed in the "Ask the mini…" box on the Mac mini.
+    /// An empty prompt (or a status-y phrase) maps to a friendly terminal summary.
+    private func sendCommandToMini(_ raw: String) {
+        currentState = .thinking
+        hideInputWindow()
+        setFlapSpeed(excitedFlapSpeed)
+
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = trimmed.lowercased()
+        let isStatusQuery = trimmed.isEmpty
+            || lower == "status"
+            || lower.contains("what's running")
+            || lower.contains("whats running")
+            || lower.contains("what is running")
+            || lower.contains("terminals")
+        let command = isStatusQuery ? "__status__" : trimmed
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15.0) { [weak self] in
+            guard let self = self else { return }
+            if self.currentState == .thinking { self.agentDidTimeout() }
+        }
+
+        remoteMonitor.runRemote(command) { [weak self] output in
+            guard let self = self else { return }
+            guard self.currentState == .thinking else { return } // timed out already
+            self.triggerExcitement()
+            var text = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if text == "__NAVI_OFFLINE__" || text.isEmpty {
+                text = "🌙 The mini isn't reachable right now."
+            }
+            if text.count > 280 { text = String(text.prefix(280)) + "…" }
+            self.showResponse(text)
+        }
+    }
+
+    /// Reflect the mini's live terminal state in Navi's body language.
+    private func handleRemoteStatus(_ status: RemoteStatus) {
+        let prevReachable = remoteReachable
+        let prevTerms = prevTerminals
+        remoteShells = status.shells
+        remoteBusy = status.busy
+        remoteReachable = status.reachable
+        prevTerminals = status.terminals
+
+        // Sparkle count == number of live terminals on the mini (1 when offline/idle).
+        let sparkleCount = status.reachable ? max(1, min(6, status.shells)) : 1
+        updateSparkleVisibility(count: sparkleCount)
+
+        // Calm, persistent "something's running over there" glow — only refreshed when
+        // an attention burst isn't currently overriding the glow, and only while wandering.
+        if currentState == .wandering && attentionTimer == nil {
+            if status.busy > 0 && !ambientBusy {
+                ambientBusy = true
+                glowView.layer?.shadowColor = NSColor.systemPurple.cgColor
+                glowView.layer?.shadowRadius = 14
+                glowView.layer?.shadowOpacity = 0.45
+            } else if status.busy == 0 && ambientBusy {
+                ambientBusy = false
+                glowView.layer?.shadowOpacity = 0.0
+            }
+        } else {
+            ambientBusy = status.busy > 0   // keep flag in sync for endAttention()
+        }
+
+        // Establish a baseline on the first sample so we don't alert on startup.
+        if !hadFirstPoll {
+            hadFirstPoll = true
+            return
+        }
+
+        // --- Attention events: a transient fast-flap burst to catch the eye ---
+
+        // 1) Mini came back / dropped off the network.
+        if prevReachable != status.reachable {
+            drawAttention(status.reachable ? heySound : outSound)
+            return
+        }
+
+        // 2) A command finished on some terminal (a busy tty returned to its prompt).
+        //    codex/claude staying busy won't transition, so they don't spam.
+        if status.reachable {
+            for (tty, prevCmd) in prevTerms where prevCmd != "-" {
+                let nowCmd = status.terminals[tty] ?? "-"
+                if nowCmd == "-" {
+                    drawAttention(heySound)
+                    break
+                }
+            }
+        }
+    }
+
+    /// A short fast-flap "Hey! Listen!" burst to draw the eye, then auto-settle.
+    /// Flapping is cheap (layer animation), so we run it even under CPU load — just
+    /// not while the screen is off.
+    private func drawAttention(_ sound: NSSound?) {
+        guard !displayAsleep else { return }
+        setFlapSpeed(excitedFlapSpeed)
+        glowView.layer?.shadowColor = NSColor.systemPurple.cgColor
+        glowView.layer?.shadowRadius = 22
+        glowView.layer?.shadowOpacity = 1.0
+        sound?.play()
+
+        attentionTimer?.invalidate()
+        attentionTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: false) { [weak self] _ in
+            self?.endAttention()
+        }
+    }
+
+    private func endAttention() {
+        attentionTimer = nil
+        // Only settle if a user interaction hasn't taken over in the meantime.
+        guard currentState == .wandering else { return }
+        setFlapSpeed(idleFlapSpeed)
+        if ambientBusy {
+            glowView.layer?.shadowRadius = 14
+            glowView.layer?.shadowOpacity = 0.45
+        } else {
+            glowView.layer?.shadowOpacity = 0.0
+        }
+    }
+
+    private func updateSparkleVisibility(count: Int) {
+        for (index, sparkle) in sparkleViews.enumerated() {
+            sparkle.isHidden = index >= count
+        }
+    }
+
+    private func showResponse(_ text: String) {
+        currentState = .speaking
+        outSound?.play()
+        
+        guard let visibleFrame = window.screen?.visibleFrame ?? NSScreen.main?.visibleFrame else { return }
+        
+        if outputWindow == nil {
+            let width: CGFloat = 350
+            let height: CGFloat = 120
+            
+            let win = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: width, height: height), // Will position below
+                styleMask: [.borderless],
+                backing: .buffered,
+                defer: false
+            )
+            win.isOpaque = false
+            win.backgroundColor = .clear
+            win.level = .floating
+            win.hasShadow = true
+            
+            let visualEffect = NSVisualEffectView(frame: NSRect(origin: .zero, size: win.frame.size))
+            visualEffect.material = .hudWindow
+            visualEffect.blendingMode = .behindWindow
+            visualEffect.state = .active
+            visualEffect.wantsLayer = true
+            visualEffect.layer?.cornerRadius = 20
+            visualEffect.layer?.masksToBounds = true
+            visualEffect.layer?.borderWidth = 0
+            visualEffect.layer?.borderColor = NSColor.clear.cgColor
+            
+            let tf = NonVibrantTextField(frame: NSRect(x: 20, y: 20, width: width - 40, height: height - 40))
+            tf.isBordered = false
+            tf.isBezeled = false
+            tf.drawsBackground = false
+            tf.backgroundColor = .clear
+            tf.isEditable = false
+            tf.isSelectable = false
+            tf.lineBreakMode = .byWordWrapping
+            tf.font = NSFont.systemFont(ofSize: 16, weight: .regular)
+            tf.textColor = .white
+            tf.stringValue = ""
+            
+            visualEffect.addSubview(tf)
+            win.contentView = visualEffect
+            
+            self.outputWindow = win
+            self.outputField = tf
+        }
+        
+        // Position window to the right of Navi
+        let fairyFrame = fairyScreenFrame()
+        let outX = min(fairyFrame.maxX + 20, visibleFrame.maxX - 350 - edgeInset)
+        let outY = fairyFrame.midY - 60
+        outputWindow?.setFrameOrigin(NSPoint(x: outX, y: outY))
+        
+        outputWindow?.orderFront(nil)
+        
+        // Typewriter effect
+        outputField?.stringValue = ""
+        typewriterTimer?.invalidate()
+        
+        var charIndex = 0
+        let chars = Array(text)
+
+        // Speed the typewriter up for longer payloads (e.g. mini command output).
+        let typeInterval: TimeInterval = chars.count > 120 ? 0.012 : 0.03
+        typewriterTimer = Timer.scheduledTimer(withTimeInterval: typeInterval, repeats: true) { [weak self] timer in
+            guard let self = self else {
+                timer.invalidate()
+                return
+            }
+            if charIndex < chars.count {
+                self.outputField?.stringValue.append(chars[charIndex])
+                charIndex += 1
+            } else {
+                timer.invalidate()
+                // Wait a few seconds, then hide and return to wandering
+                DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
+                    self.hideOutputWindow()
+                    if self.currentState == .speaking {
+                        self.currentState = .wandering
+                        self.startWandering()
+                    }
+                }
+            }
+        }
+    }
+
+    private func hideOutputWindow() {
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.5
+            self.outputWindow?.animator().alphaValue = 0.0
+        }) {
+            self.outputWindow?.orderOut(nil)
+            self.outputWindow?.alphaValue = 1.0 // reset for next time
+        }
+    }
+
 
     private func buildFairy() {
         glowView = createGlowView()
@@ -185,10 +854,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         bodyView = createBodyView()
         fairyView.addSubview(bodyView)
 
-        sparkleViews = [
-            createSparkleView(size: 5),
-            createSparkleView(size: 4)
-        ]
+        // Up to 6 sparkles; how many are shown reflects the mini's live terminal count.
+        let sparkleSizes: [CGFloat] = [5, 4, 5, 4, 3, 4]
+        sparkleViews = sparkleSizes.map { createSparkleView(size: $0) }
 
         for sparkle in sparkleViews {
             fairyView.addSubview(sparkle)
@@ -514,8 +1182,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             layer.removeAnimation(forKey: "twinkle")
             layer.removeAnimation(forKey: "sparkleScale")
 
-            let orbitWidth: CGFloat = index == 0 ? 42 : 34
-            let orbitHeight: CGFloat = index == 0 ? 28 : 22
+            // Stagger each sparkle onto its own ring so a swarm reads cleanly.
+            let ring = CGFloat(index % 3)
+            let orbitWidth: CGFloat = 30 + ring * 8
+            let orbitHeight: CGFloat = orbitWidth * 0.66
             let orbitRect = CGRect(
                 x: center.x - (orbitWidth / 2),
                 y: center.y - (orbitHeight / 2),
@@ -530,17 +1200,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             let orbit = CAKeyframeAnimation(keyPath: "position")
             orbit.path = orbitPath
-            orbit.duration = index == 0 ? 2.8 : 2.1
+            orbit.duration = 2.0 + Double(index) * 0.35
             orbit.repeatCount = .infinity
             orbit.calculationMode = .paced
-            orbit.beginTime = CACurrentMediaTime() + (Double(index) * 0.45)
+            orbit.beginTime = CACurrentMediaTime() + (Double(index) * 0.4)
             orbit.fillMode = .backwards
             layer.add(orbit, forKey: "orbit")
 
             let twinkle = CABasicAnimation(keyPath: "opacity")
-            twinkle.fromValue = index == 0 ? 0.25 : 0.15
+            twinkle.fromValue = 0.2
             twinkle.toValue = 1.0
-            twinkle.duration = index == 0 ? 0.7 : 0.55
+            twinkle.duration = 0.55 + Double(index % 3) * 0.12
             twinkle.autoreverses = true
             twinkle.repeatCount = .infinity
             twinkle.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
@@ -563,62 +1233,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func startWandering() {
-        if isAnimating { return }
-        guard let visibleFrame = window.screen?.visibleFrame ?? NSScreen.main?.visibleFrame else { return }
+        if currentState != .wandering { return }
+        // Hold position (cheap hover only) while the Mac is busy or the screen is off.
+        if calmMode || displayAsleep { return }
 
-        let minX = visibleFrame.minX + edgeInset
-        let maxX = visibleFrame.maxX - fairySize - edgeInset
-        let minY = visibleFrame.minY + edgeInset
-        let maxY = visibleFrame.maxY - fairySize - edgeInset
+        let cs = contentSize
+        guard cs.width > fairySize, cs.height > fairySize else { return }
 
-        let destination = NSRect(
-            x: randomCoordinate(min: minX, max: maxX, fallback: visibleFrame.midX - (fairySize / 2)),
-            y: randomCoordinate(min: minY, max: maxY, fallback: visibleFrame.midY - (fairySize / 2)),
-            width: fairySize,
-            height: fairySize
+        let minX = edgeInset
+        let maxX = cs.width - fairySize - edgeInset
+        let minY = edgeInset
+        let maxY = cs.height - fairySize - edgeInset
+
+        let destination = CGPoint(
+            x: randomCoordinate(min: minX, max: maxX, fallback: (cs.width - fairySize) / 2),
+            y: randomCoordinate(min: minY, max: maxY, fallback: (cs.height - fairySize) / 2)
         )
 
-        let dx = window.frame.origin.x - destination.origin.x
-        let dy = window.frame.origin.y - destination.origin.y
+        let cur = fairyView.frame.origin
+        let dx = cur.x - destination.x
+        let dy = cur.y - destination.y
         let distance = sqrt((dx * dx) + (dy * dy))
         let duration = max(1.4, TimeInterval(distance / wanderSpeed))
 
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = duration
-            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            self.window.animator().setFrame(destination, display: true)
-        }) {
-            if !self.isAnimating {
+        moveFairy(toLocal: destination, duration: duration, timing: .easeInEaseOut) {
+            if self.currentState == .wandering && !self.calmMode && !self.displayAsleep {
                 self.startWandering()
             }
         }
     }
 
     private func triggerExcitement() {
-        if isAnimating { return }
-        isAnimating = true
-
-        guard let visibleFrame = window.screen?.visibleFrame ?? NSScreen.main?.visibleFrame else {
-            isAnimating = false
-            return
+        // Reset state from thinking to wandering when task is done
+        if currentState == .thinking {
+            currentState = .wandering
+            setFlapSpeed(idleFlapSpeed)
         }
 
-        let targetFrame = centeredFrame(in: visibleFrame)
+        let center = centeredLocalOrigin()
         setFlapSpeed(excitedFlapSpeed)
 
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = 0.55
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            self.window.animator().setFrame(targetFrame, display: true)
-        }) {
-            let baseY = targetFrame.origin.y
-            self.excitedBob(targetY: baseY + 44, duration: 0.26) {
-                self.excitedBob(targetY: baseY - 18, duration: 0.26) {
-                    self.excitedBob(targetY: baseY + 34, duration: 0.24) {
-                        self.excitedBob(targetY: baseY, duration: 0.24) {
-                            self.isAnimating = false
-                            self.startIdleFlap()
-                            self.startWandering()
+        moveFairy(toLocal: center, duration: 0.55, timing: .easeOut) {
+            let baseY = center.y
+            self.excitedBob(toY: baseY + 44, duration: 0.26) {
+                self.excitedBob(toY: baseY - 18, duration: 0.26) {
+                    self.excitedBob(toY: baseY + 34, duration: 0.24) {
+                        self.excitedBob(toY: baseY, duration: 0.24) {
+                            if self.currentState == .wandering {
+                                self.startIdleFlap()
+                                self.startWandering()
+                            }
                         }
                     }
                 }
@@ -626,20 +1290,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func excitedBob(targetY: CGFloat, duration: TimeInterval, completion: @escaping () -> Void) {
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = duration
-            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            var frame = self.window.frame
-            frame.origin.y = targetY
-            self.window.animator().setFrame(frame, display: true)
-        }) {
-            completion()
-        }
+    private func excitedBob(toY y: CGFloat, duration: TimeInterval, completion: @escaping () -> Void) {
+        let origin = CGPoint(x: fairyView.frame.origin.x, y: y)
+        moveFairy(toLocal: origin, duration: duration, timing: .easeInEaseOut, completion: completion)
     }
 }
 
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.run()
+extension AppDelegate: NSTextFieldDelegate {
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+            // User pressed Enter
+            let prompt = control.stringValue
+            if inputMode == .mini {
+                // Empty prompt in mini mode == "give me a status summary".
+                sendCommandToMini(prompt)
+            } else if !prompt.isEmpty {
+                sendPromptToAgent(prompt)
+            } else {
+                cancelListening()
+            }
+            return true
+        } else if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+            // User pressed Escape
+            cancelListening()
+            return true
+        }
+        return false
+    }
+}
+
+extension AppDelegate: NSWindowDelegate {
+    func windowWillReturnFieldEditor(_ sender: NSWindow, to client: Any?) -> Any? {
+        if customFieldEditor == nil {
+            let fieldEditor = NSTextView()
+            fieldEditor.isFieldEditor = true
+            fieldEditor.drawsBackground = false
+            fieldEditor.backgroundColor = .clear
+            fieldEditor.insertionPointColor = .white
+            fieldEditor.focusRingType = .none
+            customFieldEditor = fieldEditor
+        }
+        
+        if let tf = client as? NSTextField {
+            customFieldEditor?.font = tf.font
+            customFieldEditor?.textColor = tf.textColor
+        }
+        
+        return customFieldEditor
+    }
+}
+@main
+struct NaviApp {
+    static func main() {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        app.run()
+    }
+}
